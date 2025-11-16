@@ -1,4 +1,5 @@
-// server.js – TSE-X backend with real USDC on Base, remainingMs, and 0.01 USDC demo
+// server.js – TSE-X backend with real USDC on Base, remainingMs, 0.01 USDC demo,
+// single-use tx hash, and manual lock/unlock/end-service controls
 
 require("dotenv").config();
 const express = require("express");
@@ -50,7 +51,7 @@ function setLocked(deviceId) {
   const d = getDevice(deviceId);
   d.state = "locked";
   d.unlockUntil = 0;
-  console.log(`Device ${deviceId} -> LOCKED`);
+  console.log(`Device ${deviceId} -> LOCKED (rental ended)`);
   return d.unlockUntil;
 }
 
@@ -65,6 +66,37 @@ function setUnlocked(deviceId, minutes) {
       d.unlockUntil
     ).toISOString()})`
   );
+  return d.unlockUntil;
+}
+
+// Manual lock/unlock (do NOT change unlockUntil, only state)
+function manualLock(deviceId) {
+  const d = getDevice(deviceId);
+  const now = Date.now();
+  if (d.unlockUntil <= now) {
+    throw new Error("No active rental for this device.");
+  }
+  d.state = "locked";
+  console.log(`Device ${deviceId} -> MANUAL LOCK (rental still active)`);
+  return d.unlockUntil;
+}
+
+function manualUnlock(deviceId) {
+  const d = getDevice(deviceId);
+  const now = Date.now();
+  if (d.unlockUntil <= now) {
+    throw new Error("No active rental for this device.");
+  }
+  d.state = "unlocked";
+  console.log(`Device ${deviceId} -> MANUAL UNLOCK (rental still active)`);
+  return d.unlockUntil;
+}
+
+function endService(deviceId) {
+  const d = getDevice(deviceId);
+  d.state = "locked";
+  d.unlockUntil = 0;
+  console.log(`Device ${deviceId} -> END SERVICE (locked, time cleared)`);
   return d.unlockUntil;
 }
 
@@ -89,6 +121,9 @@ function usdcToUnits(amountStr) {
   const frac = (fracRaw + "000000").slice(0, 6); // pad/trim to 6
   return BigInt(whole || "0") * 1000000n + BigInt(frac || "0");
 }
+
+// ---------- Single-use tx hash store ----------
+const usedTxHashes = new Set(); // stores lowercase tx hashes
 
 // ---------- Routes ----------
 
@@ -152,7 +187,7 @@ app.post("/api/unlock-request", (req, res) => {
   });
 });
 
-// Confirm payment – real USDC verification on Base
+// Confirm payment – real USDC verification on Base, single-use tx hash
 app.post("/api/unlock-confirm", async (req, res) => {
   try {
     const { deviceId, minutes, txHash } = req.body || {};
@@ -170,6 +205,17 @@ app.post("/api/unlock-confirm", async (req, res) => {
     }
 
     const cleanHash = txHash.trim();
+    const hashKey = cleanHash.toLowerCase();
+
+    // 🔒 Block reuse of the same tx hash
+    if (usedTxHashes.has(hashKey)) {
+      console.log("unlock-confirm: tx hash already used", hashKey);
+      return res.status(400).json({
+        error:
+          "This transaction hash has already been used for an unlock and cannot be reused.",
+      });
+    }
+
     console.log("unlock-confirm: verifying tx", {
       deviceId,
       minutes,
@@ -245,6 +291,9 @@ app.post("/api/unlock-confirm", async (req, res) => {
     // ----- 3) All good -> unlock device -----
     const unlockUntil = setUnlocked(deviceId, minutes);
 
+    // 🔒 Mark this tx hash as used so it can't be reused
+    usedTxHashes.add(hashKey);
+
     return res.json({ ok: true, unlockUntil });
   } catch (err) {
     console.error("unlock-confirm error:", err?.response?.data || err.message);
@@ -252,11 +301,33 @@ app.post("/api/unlock-confirm", async (req, res) => {
   }
 });
 
-// Optional: manual lock endpoint (for debugging/admin)
-app.post("/api/devices/:id/lock", (req, res) => {
+// Manual lock (does not end rental, just sets state=locked if rental is active)
+app.post("/api/devices/:id/manual-lock", (req, res) => {
   const id = req.params.id;
-  const unlockUntil = setLocked(id);
-  res.json({ ok: true, deviceId: id, unlockUntil });
+  try {
+    const unlockUntil = manualLock(id);
+    res.json({ ok: true, deviceId: id, state: "locked", unlockUntil });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// Manual unlock (does not extend rental, just sets state=unlocked if rental is active)
+app.post("/api/devices/:id/manual-unlock", (req, res) => {
+  const id = req.params.id;
+  try {
+    const unlockUntil = manualUnlock(id);
+    res.json({ ok: true, deviceId: id, state: "unlocked", unlockUntil });
+  } catch (e) {
+    res.status(400).json({ error: e.message });
+  }
+});
+
+// End service – lock and clear time (ends access immediately)
+app.post("/api/devices/:id/end-service", (req, res) => {
+  const id = req.params.id;
+  const unlockUntil = endService(id);
+  res.json({ ok: true, deviceId: id, state: "locked", unlockUntil });
 });
 
 // ---------- Start server ----------
