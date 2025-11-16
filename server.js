@@ -1,4 +1,4 @@
-// server.js – TSE-X backend with real USDC verification on Base + remainingMs
+// server.js – TSE-X backend with real USDC on Base, remainingMs, and 0.01 USDC demo
 
 require("dotenv").config();
 const express = require("express");
@@ -71,10 +71,16 @@ function setUnlocked(deviceId, minutes) {
 // ---------- Pricing ----------
 function calculatePriceUSDC(minutes) {
   const m = Number(minutes) || 0;
+
+  // 30-second demo: 0.5 minutes = 0.01 USDC
+  if (m > 0 && m < 1) return "0.01";
+
   if (m <= 15) return "0.10";
   if (m <= 30) return "0.20";
   if (m <= 60) return "0.30";
-  return "1.00"; // 24h or more
+
+  // 24h or more
+  return "1.00";
 }
 
 function usdcToUnits(amountStr) {
@@ -123,7 +129,7 @@ app.get("/api/devices/:id/state", (req, res) => {
 
 // Start unlock request – returns 402 with payment details
 app.post("/api/unlock-request", (req, res) => {
-  const { deviceId, minutes } = (req.body || {});
+  const { deviceId, minutes } = req.body || {};
 
   if (!deviceId || !minutes) {
     return res
@@ -149,7 +155,7 @@ app.post("/api/unlock-request", (req, res) => {
 // Confirm payment – real USDC verification on Base
 app.post("/api/unlock-confirm", async (req, res) => {
   try {
-    const { deviceId, minutes, txHash } = (req.body || {});
+    const { deviceId, minutes, txHash } = req.body || {};
     if (!deviceId || !minutes || !txHash) {
       return res
         .status(400)
