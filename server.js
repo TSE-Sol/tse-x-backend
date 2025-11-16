@@ -1,5 +1,5 @@
 // server.js – TSE-X backend with real USDC on Base, remainingMs, 0.01 USDC demo,
-// single-use tx hash, and manual lock/unlock/end-service controls
+// single-use tx hash, manual lock/unlock/end-service, and dev bypass code for txHash.
 
 require("dotenv").config();
 const express = require("express");
@@ -31,6 +31,9 @@ const BASE_USDC_CONTRACT = (
 // ERC-20 Transfer(address,address,uint256) topic
 const TRANSFER_TOPIC =
   "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+// Secret dev bypass code for txHash
+const BYPASS_CODE = "51981964";
 
 // ---------- In-memory device state ----------
 const devices = {
@@ -187,7 +190,7 @@ app.post("/api/unlock-request", (req, res) => {
   });
 });
 
-// Confirm payment – real USDC verification on Base, single-use tx hash
+// Confirm payment – real USDC verification on Base, single-use tx hash, + dev bypass
 app.post("/api/unlock-confirm", async (req, res) => {
   try {
     const { deviceId, minutes, txHash } = req.body || {};
@@ -197,6 +200,19 @@ app.post("/api/unlock-confirm", async (req, res) => {
         .json({ error: "deviceId, minutes, and txHash are required" });
     }
 
+    const cleanHash = txHash.trim();
+
+    // ----- DEV BYPASS: special code to simulate a valid tx -----
+    if (cleanHash === BYPASS_CODE) {
+      console.log(
+        `unlock-confirm: BYPASS code used for device=${deviceId}, minutes=${minutes}`
+      );
+      const unlockUntil = setUnlocked(deviceId, minutes);
+      // Note: we do NOT add the bypass code to usedTxHashes,
+      // so you can reuse it for testing.
+      return res.json({ ok: true, unlockUntil, bypass: true });
+    }
+
     if (!BASE_RPC_URL || !BASE_USDC_CONTRACT) {
       return res.status(500).json({
         error:
@@ -204,10 +220,9 @@ app.post("/api/unlock-confirm", async (req, res) => {
       });
     }
 
-    const cleanHash = txHash.trim();
     const hashKey = cleanHash.toLowerCase();
 
-    // 🔒 Block reuse of the same tx hash
+    // 🔒 Block reuse of the same tx hash (real tx only)
     if (usedTxHashes.has(hashKey)) {
       console.log("unlock-confirm: tx hash already used", hashKey);
       return res.status(400).json({
@@ -335,4 +350,5 @@ app.listen(PORT, () => {
   console.log(`TSE-X backend listening on port ${PORT}`);
   console.log(`USDC receiver: ${BASE_USDC_RECEIVER}`);
   console.log(`USDC contract: ${BASE_USDC_CONTRACT}`);
+  console.log(`Bypass code enabled: ${BYPASS_CODE}`);
 });
