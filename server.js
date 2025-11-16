@@ -1,4 +1,4 @@
-// server.js – TSE-X backend with real USDC verification on Base
+// server.js – TSE-X backend with real USDC verification on Base + remainingMs
 
 require("dotenv").config();
 const express = require("express");
@@ -21,7 +21,7 @@ const BASE_USDC_RECEIVER =
   (process.env.BASE_USDC_RECEIVER ||
     "0x8469a3A136AE586356bAA89C61191D8E2d84B92f").toLowerCase();
 
-// Official USDC on Base mainnet
+// Official USDC contract on Base mainnet
 const BASE_USDC_CONTRACT = (
   process.env.BASE_USDC_CONTRACT ||
   "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
@@ -33,7 +33,6 @@ const TRANSFER_TOPIC =
 
 // ---------- In-memory device state ----------
 const devices = {
-  // default device
   "bike-1": {
     state: "locked", // "locked" | "unlocked"
     unlockUntil: 0,  // ms since epoch
@@ -72,13 +71,10 @@ function setUnlocked(deviceId, minutes) {
 // ---------- Pricing ----------
 function calculatePriceUSDC(minutes) {
   const m = Number(minutes) || 0;
-
   if (m <= 15) return "0.10";
   if (m <= 30) return "0.20";
   if (m <= 60) return "0.30";
-
-  // 24h or more
-  return "1.00";
+  return "1.00"; // 24h or more
 }
 
 function usdcToUnits(amountStr) {
@@ -98,12 +94,13 @@ app.get("/", (req, res) => {
   });
 });
 
-// Current device state (used by the Arduino)
+// Current device state (Arduino polls this)
 app.get("/api/devices/:id/state", (req, res) => {
   const id = req.params.id;
   const d = getDevice(id);
 
   const now = Date.now();
+
   // Auto relock if time expired
   if (d.state === "unlocked" && d.unlockUntil > 0 && now > d.unlockUntil) {
     d.state = "locked";
@@ -111,16 +108,22 @@ app.get("/api/devices/:id/state", (req, res) => {
     console.log(`Auto-lock: device ${id} rental expired`);
   }
 
+  let remainingMs = 0;
+  if (d.state === "unlocked" && d.unlockUntil > now) {
+    remainingMs = d.unlockUntil - now;
+  }
+
   res.json({
     deviceId: id,
     state: d.state,
     unlockUntil: d.unlockUntil,
+    remainingMs,
   });
 });
 
 // Start unlock request – returns 402 with payment details
 app.post("/api/unlock-request", (req, res) => {
-  const { deviceId, minutes } = req.body || {};
+  const { deviceId, minutes } = (req.body || {});
 
   if (!deviceId || !minutes) {
     return res
@@ -129,7 +132,6 @@ app.post("/api/unlock-request", (req, res) => {
   }
 
   const price = calculatePriceUSDC(minutes);
-
   console.log("unlock-request", { deviceId, minutes, price });
 
   // 402 Payment Required – app expects amount + to
@@ -138,16 +140,16 @@ app.post("/api/unlock-request", (req, res) => {
     minutes,
     token: "USDC",
     network: "base-mainnet",
-    amount: price, // in USDC, human-readable
+    amount: price, // human-readable USDC string
     to: BASE_USDC_RECEIVER,
     note: "Send USDC on Base, then paste tx hash to confirm.",
   });
 });
 
-// Confirm payment – real USDC on Base verification
+// Confirm payment – real USDC verification on Base
 app.post("/api/unlock-confirm", async (req, res) => {
   try {
-    const { deviceId, minutes, txHash } = req.body || {};
+    const { deviceId, minutes, txHash } = (req.body || {});
     if (!deviceId || !minutes || !txHash) {
       return res
         .status(400)
