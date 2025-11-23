@@ -22,6 +22,7 @@ if (missingVars.length > 0) {
 const ALCHEMY_RPC_URL = process.env.ALCHEMY_RPC_URL;
 const JWT_SECRET = process.env.JWT_SECRET;
 const DEVICE_WALLET_ADDRESS = process.env.DEVICE_WALLET_ADDRESS;
+// Default to development mode for testing (can override with NODE_ENV env var)
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
 // USDC Contract on Base
@@ -91,12 +92,12 @@ const devices = {
     deviceId: 'X402-COFFEE-001',
     deviceName: 'Smart Coffee Maker',
     deviceType: 'Coffee Machine',
-    model: 'X402-CM Pro',
+    model: 'X402-CM Elite',
     supportsLock: false,
     supportsTimer: true,
     supportsNFC: false,
     supportsBLE: true,
-    firmwareVersion: '2.1.3',
+    firmwareVersion: '2.0.1',
     walletAddress: DEVICE_WALLET_ADDRESS,
     status: 'online',
   },
