@@ -63,6 +63,19 @@ const usdcContract = new ethers.Contract(USDC_CONTRACT, USDC_ABI, provider);
 const devices = {
   'X402-LOCK-001': {
     deviceId: 'X402-LOCK-001',
+    deviceName: 'Smart Bike Lock',
+    deviceType: 'Bike Lock',
+    model: 'X402-BL Pro',
+    supportsLock: true,
+    supportsTimer: false,
+    supportsNFC: true,
+    supportsBLE: true,
+    firmwareVersion: '1.2.1',
+    walletAddress: DEVICE_WALLET_ADDRESS,
+    status: 'online',
+  },
+  'X402-LOCK-002': {
+    deviceId: 'X402-LOCK-002',
     deviceName: 'Office Door Lock',
     deviceType: 'Door Lock',
     model: 'X402-DL Standard',
@@ -504,5 +517,9 @@ app.listen(PORT, () => {
   console.log('📱 Device Wallet:', DEVICE_WALLET_ADDRESS);
   console.log('🔐 JWT Secret:', JWT_SECRET ? '✓ Set' : '✗ NOT SET');
   console.log('🌍 Environment:', NODE_ENV);
+  console.log('\n📱 Available Devices:');
+  Object.keys(devices).forEach(id => {
+    console.log(`   - ${id}: ${devices[id].deviceName}`);
+  });
   console.log('\n');
 });
