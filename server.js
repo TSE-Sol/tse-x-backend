@@ -1,402 +1,508 @@
-// X.402 Backend - Node.js + Express + Base Blockchain
-// Pay-per-use device access with USDC payments on Base
-
 require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
-const jwt = require('jsonwebtoken');
 const { ethers } = require('ethers');
-const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
 
 const app = express();
-app.use(cors());
+const PORT = process.env.PORT || 3000;
+
+// ============ ENVIRONMENT VARIABLES ============
+const requiredEnvVars = [
+  'ALCHEMY_RPC_URL',
+  'JWT_SECRET',
+  'DEVICE_WALLET_ADDRESS',
+];
+
+const missingVars = requiredEnvVars.filter(v => !process.env[v]);
+if (missingVars.length > 0) {
+  console.error('❌ Missing environment variables:', missingVars.join(', '));
+  process.exit(1);
+}
+
+const ALCHEMY_RPC_URL = process.env.ALCHEMY_RPC_URL;
+const JWT_SECRET = process.env.JWT_SECRET;
+const DEVICE_WALLET_ADDRESS = process.env.DEVICE_WALLET_ADDRESS;
+const NODE_ENV = process.env.NODE_ENV || 'development';
+
+// USDC Contract on Base
+const USDC_CONTRACT = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+const USDC_DECIMALS = 6;
+
+// Payment amounts (in USDC)
+const UNLOCK_COST = ethers.parseUnits('0.50', USDC_DECIMALS);
+const BREW_COST = ethers.parseUnits('0.25', USDC_DECIMALS);
+
+// ============ MIDDLEWARE ============
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET;
-const ALCHEMY_BASE_RPC = process.env.ALCHEMY_RPC_URL;
-const DEVICE_WALLET = process.env.DEVICE_WALLET_ADDRESS;
-
-// USDC on Base contract address
-const USDC_BASE_ADDRESS = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
-
-// Validate required environment variables
-if (!JWT_SECRET) {
-  console.error('ERROR: JWT_SECRET is not set in environment variables');
-  process.exit(1);
-}
-if (!ALCHEMY_BASE_RPC) {
-  console.error('ERROR: ALCHEMY_RPC_URL is not set in environment variables');
-  process.exit(1);
-}
-if (!DEVICE_WALLET) {
-  console.warn('WARNING: DEVICE_WALLET_ADDRESS is not set - payments will fail');
-}
-
-// Alchemy provider for Base blockchain
-const provider = new ethers.JsonRpcProvider(ALCHEMY_BASE_RPC);
-
-// In-memory storage (replace with database in production)
-const challenges = new Map(); // walletAddress -> { challenge, expiresAt }
-const devices = new Map(); // deviceId -> device data
-
-// Initialize mock devices with environment wallet
-devices.set('X402-LOCK-001', {
-  deviceId: 'X402-LOCK-001',
-  deviceName: 'Smart Bike Lock',
-  deviceType: 'Bike Lock',
-  model: 'X402-BL Pro',
-  supportsLock: true,
-  supportsTimer: false,
-  supportsNFC: true,
-  supportsBLE: true,
-  costPerUse: '0.50', // USDC per unlock ($0.50)
-  walletAddress: DEVICE_WALLET,
-  rssi: -45,
-  firmwareVersion: '1.2.0',
-  currentTimerSecond: 0
+// Enable CORS for development and browser requests
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Credentials', 'true');
+  
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
 });
 
-devices.set('X402-COFFEE-001', {
-  deviceId: 'X402-COFFEE-001',
-  deviceName: 'Smart Coffee Machine',
-  deviceType: 'Coffee Machine',
-  model: 'X402-CM Elite',
-  supportsLock: false,
-  supportsTimer: true,
-  supportsNFC: true,
-  supportsBLE: true,
-  costPerUse: '0.25', // USDC per brew ($0.25)
-  walletAddress: DEVICE_WALLET,
-  rssi: -62,
-  firmwareVersion: '2.0.1',
-  currentTimerSecond: 0
-});
+// ============ ETHERS SETUP ============
+const provider = new ethers.JsonRpcProvider(ALCHEMY_RPC_URL);
 
-devices.set('X402-LOCK-002', {
-  deviceId: 'X402-LOCK-002',
-  deviceName: 'Office Door Lock',
-  deviceType: 'Door Lock',
-  model: 'X402-DL Standard',
-  supportsLock: true,
-  supportsTimer: false,
-  supportsNFC: false,
-  supportsBLE: true,
-  costPerUse: '0.50',
-  walletAddress: DEVICE_WALLET,
-  rssi: -78,
-  firmwareVersion: '1.0.5',
-  currentTimerSecond: 0
-});
+// USDC ERC-20 ABI (minimal for Transfer events)
+const USDC_ABI = [
+  'event Transfer(address indexed from, address indexed to, uint256 value)',
+  'function balanceOf(address account) public view returns (uint256)',
+];
 
-// ============================================
-// ROUTES
-// ============================================
+const usdcContract = new ethers.Contract(USDC_CONTRACT, USDC_ABI, provider);
 
-// Health check
+// ============ MOCK DEVICES DATABASE ============
+const devices = {
+  'X402-LOCK-001': {
+    deviceId: 'X402-LOCK-001',
+    deviceName: 'Office Door Lock',
+    deviceType: 'Door Lock',
+    model: 'X402-DL Standard',
+    supportsLock: true,
+    supportsTimer: false,
+    supportsNFC: true,
+    supportsBLE: true,
+    firmwareVersion: '1.0.5',
+    walletAddress: DEVICE_WALLET_ADDRESS,
+    status: 'online',
+  },
+  'X402-COFFEE-001': {
+    deviceId: 'X402-COFFEE-001',
+    deviceName: 'Smart Coffee Maker',
+    deviceType: 'Coffee Machine',
+    model: 'X402-CM Pro',
+    supportsLock: false,
+    supportsTimer: true,
+    supportsNFC: false,
+    supportsBLE: true,
+    firmwareVersion: '2.1.3',
+    walletAddress: DEVICE_WALLET_ADDRESS,
+    status: 'online',
+  },
+};
+
+// ============ HELPER FUNCTIONS ============
+
+/**
+ * Check if a wallet has made a recent USDC payment to the device wallet
+ */
+async function verifyPayment(walletAddress, deviceId, amountRequired) {
+  try {
+    console.log(`\n💰 Verifying payment from ${walletAddress}...`);
+    console.log(`   Required: ${ethers.formatUnits(amountRequired, USDC_DECIMALS)} USDC`);
+
+    // In development mode, skip payment verification
+    if (NODE_ENV === 'development') {
+      console.log('🔨 Development mode: Skipping payment verification');
+      return { verified: true, message: 'Development mode - payment skipped' };
+    }
+
+    // Get recent Transfer events (last 1000 blocks)
+    const latestBlock = await provider.getBlockNumber();
+    const fromBlock = Math.max(0, latestBlock - 1000);
+
+    const filter = usdcContract.filters.Transfer(walletAddress, DEVICE_WALLET_ADDRESS);
+    const events = await provider.getLogs({
+      address: USDC_CONTRACT,
+      topics: filter.topics,
+      fromBlock: fromBlock,
+      toBlock: 'latest',
+    });
+
+    console.log(`   Found ${events.length} transfer event(s)`);
+
+    if (events.length === 0) {
+      return { verified: false, message: 'No recent payment found' };
+    }
+
+    // Decode the latest transfer event
+    const latestEvent = events[events.length - 1];
+    const iface = new ethers.Interface(USDC_ABI);
+    const decodedEvent = iface.parseLog(latestEvent);
+
+    if (!decodedEvent) {
+      return { verified: false, message: 'Could not decode transfer event' };
+    }
+
+    const transferAmount = decodedEvent.args.value;
+    const isValid = transferAmount >= amountRequired;
+
+    console.log(`   Transfer amount: ${ethers.formatUnits(transferAmount, USDC_DECIMALS)} USDC`);
+    console.log(`   Valid: ${isValid ? '✅' : '❌'}`);
+
+    return {
+      verified: isValid,
+      amount: transferAmount,
+      message: isValid ? 'Payment verified' : 'Insufficient payment',
+    };
+  } catch (error) {
+    console.error('❌ Payment verification error:', error.message);
+    return { verified: false, message: `Verification failed: ${error.message}` };
+  }
+}
+
+/**
+ * Generate JWT session token
+ */
+function generateSessionToken(walletAddress, deviceId) {
+  const payload = {
+    walletAddress,
+    deviceId,
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 3600, // 1 hour expiry
+  };
+  return jwt.sign(payload, JWT_SECRET);
+}
+
+/**
+ * Verify JWT session token
+ */
+function verifySessionToken(token) {
+  try {
+    return jwt.verify(token, JWT_SECRET);
+  } catch (error) {
+    return null;
+  }
+}
+
+// ============ ROUTES ============
+
+/**
+ * Health check
+ */
 app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
+  res.json({
+    status: 'ok',
     timestamp: new Date().toISOString(),
     blockchain: 'Base',
-    payment: 'USDC'
+    payment: 'USDC',
+    environment: NODE_ENV,
   });
 });
 
-// Get device info (public)
+/**
+ * Get device info (public)
+ */
 app.get('/devices/:deviceId', (req, res) => {
   const { deviceId } = req.params;
-  const device = devices.get(deviceId);
-  
+  const device = devices[deviceId];
+
   if (!device) {
-    return res.status(404).json({ error: 'Device not found' });
+    return res.status(404).json({
+      error: 'Device not found',
+      deviceId,
+    });
   }
-  
-  // Return device info without sensitive wallet address
-  const { walletAddress, ...publicDeviceInfo } = device;
-  res.json(publicDeviceInfo);
+
+  res.json(device);
 });
 
-// Request authentication challenge
-app.post('/devices/:deviceId/challenge', async (req, res) => {
+/**
+ * Request authentication challenge
+ * POST /devices/:deviceId/challenge
+ * Body: { walletAddress }
+ */
+app.post('/devices/:deviceId/challenge', (req, res) => {
   const { deviceId } = req.params;
   const { walletAddress } = req.body;
-  
+
+  if (!devices[deviceId]) {
+    return res.status(404).json({ error: 'Device not found' });
+  }
+
   if (!walletAddress) {
     return res.status(400).json({ error: 'walletAddress required' });
   }
-  
-  // Validate wallet address format
-  if (!ethers.isAddress(walletAddress)) {
-    return res.status(400).json({ error: 'Invalid wallet address format' });
-  }
-  
-  const device = devices.get(deviceId);
-  if (!device) {
-    return res.status(404).json({ error: 'Device not found' });
-  }
-  
+
   // Generate random challenge
-  const challenge = crypto.randomBytes(32).toString('hex');
-  const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 minutes
-  
-  // Store challenge
-  challenges.set(walletAddress.toLowerCase(), {
-    challenge,
-    expiresAt,
-    deviceId
-  });
-  
+  const challenge = Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
+  const expiresAt = new Date(Date.now() + 5 * 60 * 1000); // 5 min expiry
+
   res.json({
     challenge,
-    expiresAt: expiresAt.toISOString(),
     deviceId,
-    message: `Sign this message to authenticate: ${challenge}`
+    expiresAt: expiresAt.toISOString(),
+    message: 'Sign this challenge with your wallet',
   });
 });
 
-// Verify signature + payment
+/**
+ * Verify payment + grant session token
+ * POST /devices/:deviceId/verify
+ * Body: { walletAddress, challenge, signature, timestamp }
+ */
 app.post('/devices/:deviceId/verify', async (req, res) => {
   const { deviceId } = req.params;
-  const { walletAddress, challenge, signature } = req.body;
-  
-  if (!walletAddress || !challenge || !signature) {
-    return res.status(400).json({ error: 'walletAddress, challenge, and signature required' });
-  }
-  
-  const device = devices.get(deviceId);
-  if (!device) {
+  const { walletAddress, challenge, signature, timestamp } = req.body;
+
+  if (!devices[deviceId]) {
     return res.status(404).json({ error: 'Device not found' });
   }
-  
-  // Verify challenge exists and hasn't expired
-  const storedChallenge = challenges.get(walletAddress.toLowerCase());
-  if (!storedChallenge || storedChallenge.challenge !== challenge) {
-    return res.status(401).json({ error: 'Invalid challenge' });
+
+  if (!walletAddress) {
+    return res.status(400).json({ error: 'walletAddress required' });
   }
-  
-  if (new Date() > storedChallenge.expiresAt) {
-    challenges.delete(walletAddress.toLowerCase());
-    return res.status(401).json({ error: 'Challenge expired' });
-  }
-  
-  // Verify signature
-  try {
-    const message = `Sign this message to authenticate: ${challenge}`;
-    const recoveredAddress = ethers.verifyMessage(message, signature);
-    
-    if (recoveredAddress.toLowerCase() !== walletAddress.toLowerCase()) {
-      return res.status(401).json({ error: 'Invalid signature' });
+
+  console.log(`\n🔐 Verify request for ${deviceId} from ${walletAddress}`);
+
+  // In development, skip signature verification
+  if (NODE_ENV !== 'development') {
+    if (!challenge || !signature) {
+      return res.status(400).json({ error: 'challenge and signature required' });
     }
-  } catch (err) {
-    console.error('Signature verification failed:', err);
-    return res.status(401).json({ error: 'Signature verification failed' });
   }
-  
-  // Check USDC payment on Base blockchain
-  try {
-    const hasPaid = await checkRecentPayment(walletAddress, device.walletAddress, device.costPerUse);
-    
-    if (!hasPaid) {
-      return res.status(402).json({ 
-        error: 'Payment required',
-        costPerUse: device.costPerUse,
-        currency: 'USDC',
-        deviceWallet: device.walletAddress,
-        usdcContract: USDC_BASE_ADDRESS,
-        chainId: 8453, // Base mainnet
-        message: `Please send ${device.costPerUse} USDC to ${device.walletAddress} on Base`
-      });
-    }
-  } catch (err) {
-    console.error('Payment check failed:', err);
-    return res.status(500).json({ error: 'Payment verification failed' });
+
+  // Verify payment
+  const paymentCheck = await verifyPayment(walletAddress, deviceId, UNLOCK_COST);
+
+  if (!paymentCheck.verified) {
+    return res.status(402).json({
+      verified: false,
+      message: paymentCheck.message,
+      requiredAmount: ethers.formatUnits(UNLOCK_COST, USDC_DECIMALS),
+      currency: 'USDC',
+    });
   }
-  
-  // Generate session token (valid for 1 hour)
-  const sessionToken = jwt.sign(
-    { 
-      walletAddress: walletAddress.toLowerCase(), 
-      deviceId,
-      exp: Math.floor(Date.now() / 1000) + (60 * 60) // 1 hour
-    },
-    JWT_SECRET
-  );
-  
-  // Clear challenge
-  challenges.delete(walletAddress.toLowerCase());
-  
+
+  // Generate session token
+  const sessionToken = generateSessionToken(walletAddress, deviceId);
+
   res.json({
     verified: true,
     sessionToken,
-    deviceData: device,
+    deviceData: devices[deviceId],
     accessLevel: 'full',
-    expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString()
+    expiresAt: new Date(Date.now() + 3600000).toISOString(),
+    message: 'Access granted',
   });
 });
 
-// Device control - Lock
-app.post('/devices/:deviceId/lock', authenticateToken, async (req, res) => {
+/**
+ * Unlock device
+ * POST /devices/:deviceId/unlock
+ * Headers: Authorization: Bearer <token>
+ * Body: { walletAddress, timestamp }
+ */
+app.post('/devices/:deviceId/unlock', async (req, res) => {
   const { deviceId } = req.params;
-  const device = devices.get(deviceId);
-  
-  if (!device || !device.supportsLock) {
-    return res.status(400).json({ error: 'Device does not support lock' });
-  }
-  
-  // TODO: Send command to ESP32 device via MQTT/WebSocket
-  console.log(`Locking device ${deviceId} for wallet ${req.user.walletAddress}`);
-  
-  res.json({
-    success: true,
-    action: 'lock',
-    deviceId,
-    timestamp: new Date().toISOString()
-  });
-});
+  const { walletAddress, timestamp } = req.body;
+  const authHeader = req.headers.authorization;
 
-// Device control - Unlock
-app.post('/devices/:deviceId/unlock', authenticateToken, async (req, res) => {
-  const { deviceId } = req.params;
-  const device = devices.get(deviceId);
-  
-  if (!device || !device.supportsLock) {
-    return res.status(400).json({ error: 'Device does not support unlock' });
-  }
-  
-  // TODO: Send command to ESP32 device
-  console.log(`Unlocking device ${deviceId} for wallet ${req.user.walletAddress}`);
-  
-  res.json({
-    success: true,
-    action: 'unlock',
-    deviceId,
-    timestamp: new Date().toISOString()
-  });
-});
-
-// Device control - Brew
-app.post('/devices/:deviceId/brew', authenticateToken, async (req, res) => {
-  const { deviceId } = req.params;
-  const device = devices.get(deviceId);
-  
-  if (!device || !device.supportsTimer) {
-    return res.status(400).json({ error: 'Device does not support brew timer' });
-  }
-  
-  // TODO: Send command to ESP32 device
-  console.log(`Starting brew on device ${deviceId} for wallet ${req.user.walletAddress}`);
-  
-  res.json({
-    success: true,
-    action: 'brew',
-    deviceId,
-    duration: 30,
-    timestamp: new Date().toISOString()
-  });
-});
-
-// Get device status
-app.get('/devices/:deviceId/status', authenticateToken, (req, res) => {
-  const { deviceId } = req.params;
-  const device = devices.get(deviceId);
-  
-  if (!device) {
+  if (!devices[deviceId]) {
     return res.status(404).json({ error: 'Device not found' });
   }
-  
-  // TODO: Get real status from ESP32 device
+
+  console.log(`\n🔓 Unlock request for ${deviceId}`);
+
+  // Verify session token
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7);
+    const decoded = verifySessionToken(token);
+    if (!decoded) {
+      return res.status(401).json({ error: 'Invalid or expired session token' });
+    }
+    console.log('   ✅ Session token valid');
+  }
+
+  // Verify payment
+  const paymentCheck = await verifyPayment(walletAddress, deviceId, UNLOCK_COST);
+
+  if (!paymentCheck.verified) {
+    return res.status(402).json({
+      granted: false,
+      message: paymentCheck.message,
+      requiredAmount: ethers.formatUnits(UNLOCK_COST, USDC_DECIMALS),
+      currency: 'USDC',
+    });
+  }
+
+  // In real scenario, send command to ESP32
+  console.log('   📡 Sending unlock command to device...');
+  console.log('   ✅ Device unlocked');
+
   res.json({
+    success: true,
+    granted: true,
+    action: 'unlock',
     deviceId,
-    online: true,
-    locked: true, // Mock data
-    batteryLevel: 85,
-    lastSeen: new Date().toISOString()
+    walletAddress: walletAddress.substring(0, 10) + '...',
+    amount: ethers.formatUnits(UNLOCK_COST, USDC_DECIMALS),
+    currency: 'USDC',
+    timestamp: new Date().toISOString(),
+    message: 'Device unlocked successfully',
   });
 });
 
-// ============================================
-// MIDDLEWARE
-// ============================================
+/**
+ * Lock device
+ * POST /devices/:deviceId/lock
+ * Headers: Authorization: Bearer <token>
+ * Body: { walletAddress, timestamp }
+ */
+app.post('/devices/:deviceId/lock', async (req, res) => {
+  const { deviceId } = req.params;
+  const { walletAddress, timestamp } = req.body;
+  const authHeader = req.headers.authorization;
 
-function authenticateToken(req, res, next) {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
-  
-  if (!token) {
-    return res.status(401).json({ error: 'Authentication required' });
+  if (!devices[deviceId]) {
+    return res.status(404).json({ error: 'Device not found' });
   }
-  
-  jwt.verify(token, JWT_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid or expired token' });
+
+  console.log(`\n🔒 Lock request for ${deviceId}`);
+
+  // Verify session token
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7);
+    const decoded = verifySessionToken(token);
+    if (!decoded) {
+      return res.status(401).json({ error: 'Invalid or expired session token' });
     }
-    req.user = user;
-    next();
+    console.log('   ✅ Session token valid');
+  }
+
+  // Verify payment
+  const paymentCheck = await verifyPayment(walletAddress, deviceId, UNLOCK_COST);
+
+  if (!paymentCheck.verified) {
+    return res.status(402).json({
+      granted: false,
+      message: paymentCheck.message,
+      requiredAmount: ethers.formatUnits(UNLOCK_COST, USDC_DECIMALS),
+      currency: 'USDC',
+    });
+  }
+
+  // In real scenario, send command to ESP32
+  console.log('   📡 Sending lock command to device...');
+  console.log('   ✅ Device locked');
+
+  res.json({
+    success: true,
+    granted: true,
+    action: 'lock',
+    deviceId,
+    walletAddress: walletAddress.substring(0, 10) + '...',
+    amount: ethers.formatUnits(UNLOCK_COST, USDC_DECIMALS),
+    currency: 'USDC',
+    timestamp: new Date().toISOString(),
+    message: 'Device locked successfully',
   });
-}
+});
 
-// ============================================
-// BLOCKCHAIN HELPERS
-// ============================================
+/**
+ * Brew coffee
+ * POST /devices/:deviceId/brew
+ * Headers: Authorization: Bearer <token>
+ * Body: { walletAddress, timestamp }
+ */
+app.post('/devices/:deviceId/brew', async (req, res) => {
+  const { deviceId } = req.params;
+  const { walletAddress, timestamp } = req.body;
+  const authHeader = req.headers.authorization;
 
-// USDC ERC-20 ABI (Transfer event)
-const USDC_ABI = [
-  'event Transfer(address indexed from, address indexed to, uint256 value)',
-  'function decimals() view returns (uint8)'
-];
-
-async function checkRecentPayment(fromAddress, toAddress, expectedAmount) {
-  // Check if wallet has sent USDC payment in last 5 minutes
-  try {
-    const usdcContract = new ethers.Contract(USDC_BASE_ADDRESS, USDC_ABI, provider);
-    
-    // Get latest block
-    const latestBlock = await provider.getBlockNumber();
-    
-    // Search last ~40 blocks (roughly 5 minutes on Base, 2 sec blocks)
-    const startBlock = Math.max(0, latestBlock - 40);
-    
-    // Query Transfer events where 'from' is the user and 'to' is the device
-    const filter = usdcContract.filters.Transfer(fromAddress, toAddress);
-    const events = await usdcContract.queryFilter(filter, startBlock, latestBlock);
-    
-    // USDC has 6 decimals
-    const decimals = 6;
-    const expectedAmountBigInt = ethers.parseUnits(expectedAmount, decimals);
-    
-    for (const event of events) {
-      const amount = event.args.value;
-      
-      // Check if payment amount meets or exceeds expected
-      if (amount >= expectedAmountBigInt) {
-        console.log(`✓ Payment verified: ${ethers.formatUnits(amount, decimals)} USDC from ${fromAddress}`);
-        return true;
-      }
-    }
-    
-    console.log(`✗ No recent payment found from ${fromAddress}`);
-    return false;
-  } catch (err) {
-    console.error('Error checking USDC payment:', err);
-    // In development, return true to allow testing
-    if (process.env.NODE_ENV === 'development') {
-      console.warn('⚠️ Development mode: Skipping payment verification');
-      return true;
-    }
-    return false;
+  if (!devices[deviceId]) {
+    return res.status(404).json({ error: 'Device not found' });
   }
-}
 
-// ============================================
-// START SERVER
-// ============================================
+  console.log(`\n☕ Brew request for ${deviceId}`);
 
+  // Verify session token
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7);
+    const decoded = verifySessionToken(token);
+    if (!decoded) {
+      return res.status(401).json({ error: 'Invalid or expired session token' });
+    }
+    console.log('   ✅ Session token valid');
+  }
+
+  // Verify payment (lower cost for brew)
+  const paymentCheck = await verifyPayment(walletAddress, deviceId, BREW_COST);
+
+  if (!paymentCheck.verified) {
+    return res.status(402).json({
+      granted: false,
+      message: paymentCheck.message,
+      requiredAmount: ethers.formatUnits(BREW_COST, USDC_DECIMALS),
+      currency: 'USDC',
+    });
+  }
+
+  // In real scenario, send command to ESP32
+  console.log('   📡 Sending brew command to device...');
+  console.log('   ✅ Brewing started');
+
+  res.json({
+    success: true,
+    granted: true,
+    action: 'brew',
+    deviceId,
+    walletAddress: walletAddress.substring(0, 10) + '...',
+    amount: ethers.formatUnits(BREW_COST, USDC_DECIMALS),
+    currency: 'USDC',
+    timestamp: new Date().toISOString(),
+    brewTime: 30, // seconds
+    message: 'Brewing started',
+  });
+});
+
+/**
+ * Get device status
+ * GET /devices/:deviceId/status
+ * Headers: Authorization: Bearer <token>
+ */
+app.get('/devices/:deviceId/status', (req, res) => {
+  const { deviceId } = req.params;
+  const authHeader = req.headers.authorization;
+
+  if (!devices[deviceId]) {
+    return res.status(404).json({ error: 'Device not found' });
+  }
+
+  // Verify session token
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7);
+    const decoded = verifySessionToken(token);
+    if (!decoded) {
+      return res.status(401).json({ error: 'Invalid or expired session token' });
+    }
+  }
+
+  const device = devices[deviceId];
+  res.json({
+    deviceId,
+    status: device.status,
+    lastSeen: new Date().toISOString(),
+    isLocked: true, // would come from ESP32
+    batteryLevel: 85,
+  });
+});
+
+// ============ ERROR HANDLING ============
+app.use((err, req, res, next) => {
+  console.error('❌ Error:', err.message);
+  res.status(500).json({
+    error: 'Internal server error',
+    message: NODE_ENV === 'development' ? err.message : 'Something went wrong',
+  });
+});
+
+// ============ START SERVER ============
 app.listen(PORT, () => {
-  console.log(`🚀 X.402 Backend running on port ${PORT}`);
-  console.log(`⛓️  Base RPC: ${ALCHEMY_BASE_RPC}`);
-  console.log(`💰 USDC Contract: ${USDC_BASE_ADDRESS}`);
-  console.log(`📱 Device Wallet: ${DEVICE_WALLET || 'NOT SET'}`);
-  console.log(`🔐 JWT Secret: ${JWT_SECRET ? '✓ Set' : '✗ NOT SET'}`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log('\n');
+  console.log('🚀 X.402 Backend running on port', PORT);
+  console.log('⛓️  Base RPC:', ALCHEMY_RPC_URL.substring(0, 50) + '...');
+  console.log('💰 USDC Contract:', USDC_CONTRACT);
+  console.log('📱 Device Wallet:', DEVICE_WALLET_ADDRESS);
+  console.log('🔐 JWT Secret:', JWT_SECRET ? '✓ Set' : '✗ NOT SET');
+  console.log('🌍 Environment:', NODE_ENV);
+  console.log('\n');
 });
