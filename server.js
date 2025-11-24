@@ -234,8 +234,8 @@ app.post('/devices/:deviceId/challenge', (req, res) => {
  * POST /devices/:deviceId/verify
  * Body: { walletAddress, challenge, signature, timestamp }
  * 
- * Returns: Session token valid for 30 minutes
- * This token allows unlimited lock/unlock operations
+ * Returns: Session token valid for 30 minutes (locks)
+ * Or: Direct verification for coffee machines
  */
 app.post('/devices/:deviceId/verify', async (req, res) => {
   const { deviceId } = req.params;
@@ -251,40 +251,68 @@ app.post('/devices/:deviceId/verify', async (req, res) => {
 
   console.log(`\n🔐 Verify request for ${deviceId} from ${walletAddress.substring(0, 10)}...`);
 
-  // Check if this is a lock device
   const device = devices[deviceId];
-  if (!device.supportsLock) {
-    return res.status(400).json({ error: 'This device is not a lock' });
-  }
 
-  // Verify payment (one time per session)
-  const paymentCheck = await verifyPayment(walletAddress, deviceId, LOCK_SESSION_COST);
+  // Handle lock devices
+  if (device.supportsLock) {
+    // Verify payment (one time per session)
+    const paymentCheck = await verifyPayment(walletAddress, deviceId, LOCK_SESSION_COST);
 
-  if (!paymentCheck.verified) {
-    return res.status(402).json({
-      verified: false,
-      message: paymentCheck.message,
-      requiredAmount: ethers.formatUnits(LOCK_SESSION_COST, USDC_DECIMALS),
+    if (!paymentCheck.verified) {
+      return res.status(402).json({
+        verified: false,
+        message: paymentCheck.message,
+        requiredAmount: ethers.formatUnits(LOCK_SESSION_COST, USDC_DECIMALS),
+        currency: 'USDC',
+      });
+    }
+
+    // Payment verified! Generate session token
+    const sessionToken = generateSessionToken(walletAddress, deviceId);
+
+    console.log('   ✅ Payment verified, issuing 30-min session token');
+
+    return res.json({
+      verified: true,
+      sessionToken,
+      deviceData: device,
+      accessLevel: 'full',
+      sessionDuration: 1800, // 30 minutes in seconds
+      expiresAt: new Date(Date.now() + 1800000).toISOString(),
+      cost: ethers.formatUnits(LOCK_SESSION_COST, USDC_DECIMALS),
       currency: 'USDC',
+      message: 'Session established - pay once, unlimited lock/unlock for 30 minutes',
     });
   }
 
-  // Payment verified! Generate session token
-  const sessionToken = generateSessionToken(walletAddress, deviceId);
+  // Handle coffee devices
+  if (device.supportsTimer) {
+    // For coffee, just verify payment once per brew
+    const coffeeCost = ethers.parseUnits('0.25', USDC_DECIMALS);
+    const paymentCheck = await verifyPayment(walletAddress, deviceId, coffeeCost);
 
-  console.log('   ✅ Payment verified, issuing 30-min session token');
+    if (!paymentCheck.verified) {
+      return res.status(402).json({
+        verified: false,
+        message: paymentCheck.message,
+        requiredAmount: ethers.formatUnits(coffeeCost, USDC_DECIMALS),
+        currency: 'USDC',
+      });
+    }
 
-  res.json({
-    verified: true,
-    sessionToken,
-    deviceData: device,
-    accessLevel: 'full',
-    sessionDuration: 1800, // 30 minutes in seconds
-    expiresAt: new Date(Date.now() + 1800000).toISOString(),
-    cost: ethers.formatUnits(LOCK_SESSION_COST, USDC_DECIMALS),
-    currency: 'USDC',
-    message: 'Session established - pay once, unlimited lock/unlock for 30 minutes',
-  });
+    console.log('   ✅ Coffee payment verified');
+
+    return res.json({
+      verified: true,
+      deviceData: device,
+      accessLevel: 'brew',
+      cost: ethers.formatUnits(coffeeCost, USDC_DECIMALS),
+      currency: 'USDC',
+      message: 'Payment verified - select your brew type',
+    });
+  }
+
+  return res.status(400).json({ error: 'Unknown device type' });
 });
 
 /**
