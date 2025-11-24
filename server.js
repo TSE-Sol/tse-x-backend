@@ -1,7 +1,6 @@
 require('dotenv').config();
 const express = require('express');
 const { ethers } = require('ethers');
-const { Connection, PublicKey } = require('@solana/web3.js');
 const jwt = require('jsonwebtoken');
 
 const app = express();
@@ -40,16 +39,6 @@ app.use((req, res, next) => {
 
 // ============ ETHERS SETUP (FOR BASE) ============
 const baseProvider = new ethers.JsonRpcProvider(ALCHEMY_RPC_URL);
-
-const USDC_ABI = [
-  'event Transfer(address indexed from, address indexed to, uint256 value)',
-  'function balanceOf(address account) public view returns (uint256)',
-];
-
-const usdcContract = new ethers.Contract(USDC_CONTRACT, USDC_ABI, baseProvider);
-
-// ============ SOLANA SETUP ============
-const solanaConnection = new Connection(SOLANA_RPC_URL, 'confirmed');
 
 // ============ MOCK DEVICES DATABASE ============
 const devices = {
