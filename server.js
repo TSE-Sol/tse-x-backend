@@ -109,11 +109,26 @@ async function verifyBaseUSDCPayment(walletAddress, deviceId, amountRequired) {
     console.log(`\n💰 Verifying Base USDC payment from ${walletAddress.substring(0, 10)}...`);
     console.log(`   Required: ${ethers.formatUnits(amountRequired, USDC_DECIMALS)} USDC`);
 
-    // For testing: skip payment verification
-    console.log('🔨 Testing mode: Accepting USDC payment without verification');
-    return { verified: true, message: 'USDC payment verified (testing mode)', currency: 'USDC' };
-
-    // TODO: Real USDC verification code would go here
+    // Real USDC balance verification on Base
+    const USDC_ABI = [
+      'function balanceOf(address account) public view returns (uint256)',
+      'function decimals() public view returns (uint8)'
+    ];
+    
+    const usdcContract = new ethers.Contract(USDC_CONTRACT, USDC_ABI, baseProvider);
+    const balance = await usdcContract.balanceOf(walletAddress);
+    const balanceUSDC = ethers.formatUnits(balance, USDC_DECIMALS);
+    const requiredUSDC = ethers.formatUnits(amountRequired, USDC_DECIMALS);
+    
+    console.log(`   Wallet balance: ${balanceUSDC} USDC`);
+    
+    if (parseFloat(balanceUSDC) >= parseFloat(requiredUSDC)) {
+      console.log(`✅ USDC payment verified`);
+      return { verified: true, message: 'USDC payment verified', currency: 'USDC', balance: balanceUSDC };
+    } else {
+      console.log(`❌ Insufficient USDC balance`);
+      return { verified: false, message: `Insufficient USDC. Have: ${balanceUSDC}, Need: ${requiredUSDC}` };
+    }
   } catch (error) {
     console.error('❌ USDC verification error:', error.message);
     return { verified: false, message: `USDC verification failed: ${error.message}` };
