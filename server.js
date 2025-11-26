@@ -152,12 +152,63 @@ async function verifySolanaTokenPayment(walletAddress, deviceId, tokenMint, amou
     console.log(`   Token: ${tokenMint.substring(0, 10)}...`);
     console.log(`   Required: ${amountRequired / Math.pow(10, TSE_DECIMALS)} TSE`);
 
-    // For testing: skip payment verification
-    console.log('🔨 Testing mode: Accepting Solana token payment without verification');
-    return { verified: true, message: 'Solana payment verified (testing mode)', currency: 'TSE' };
+    // Import Solana web3.js
+    const { Connection, PublicKey } = require('@solana/web3.js');
+    
+    // Create connection to Solana mainnet
+    const connection = new Connection(SOLANA_RPC_URL, 'confirmed');
+    
+    // Parse wallet address
+    let walletPublicKey;
+    try {
+      walletPublicKey = new PublicKey(walletAddress);
+    } catch (e) {
+      console.error('❌ Invalid Solana wallet address:', walletAddress);
+      return { verified: false, message: 'Invalid Solana wallet address format' };
+    }
 
-    // TODO: Real Solana payment verification would go here
-    // Would need to check transaction history on Solana blockchain
+    // Parse token mint
+    const tokenMintPublicKey = new PublicKey(tokenMint);
+
+    console.log(`   Checking TSE balance for: ${walletAddress}`);
+
+    // Get all token accounts for this wallet
+    const tokenAccounts = await connection.getTokenAccountsByOwner(
+      walletPublicKey,
+      { mint: tokenMintPublicKey }
+    );
+
+    if (tokenAccounts.value.length === 0) {
+      console.log(`❌ No TSE token account found for wallet`);
+      return { verified: false, message: 'No TSE token account found. Please acquire some TSE.' };
+    }
+
+    // Get the balance of the first token account
+    const tokenAccount = tokenAccounts.value[0];
+    const accountInfo = await connection.getParsedAccountInfo(tokenAccount.pubkey);
+    
+    if (!accountInfo.value || !accountInfo.value.data.parsed) {
+      console.log(`❌ Could not parse token account data`);
+      return { verified: false, message: 'Error reading token account' };
+    }
+
+    const balance = BigInt(accountInfo.value.data.parsed.info.tokenAmount.amount);
+    const balanceTSE = Number(balance) / Math.pow(10, TSE_DECIMALS);
+    const requiredTSE = amountRequired / Math.pow(10, TSE_DECIMALS);
+
+    console.log(`   Wallet balance: ${balanceTSE} TSE`);
+    console.log(`   Required: ${requiredTSE} TSE`);
+
+    if (balance >= BigInt(amountRequired)) {
+      console.log(`✅ TSE payment verified`);
+      return { verified: true, message: 'TSE payment verified', currency: 'TSE', balance: balanceTSE.toFixed(2) };
+    } else {
+      console.log(`❌ Insufficient TSE balance`);
+      return { 
+        verified: false, 
+        message: `Insufficient TSE. Have: ${balanceTSE.toFixed(2)}, Need: ${requiredTSE.toFixed(2)}` 
+      };
+    }
   } catch (error) {
     console.error('❌ Solana payment verification error:', error.message);
     return { verified: false, message: `Solana verification failed: ${error.message}` };
