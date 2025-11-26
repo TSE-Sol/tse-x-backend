@@ -109,6 +109,17 @@ async function verifyBaseUSDCPayment(walletAddress, deviceId, amountRequired) {
     console.log(`\n💰 Verifying Base USDC payment from ${walletAddress.substring(0, 10)}...`);
     console.log(`   Required: ${ethers.formatUnits(amountRequired, USDC_DECIMALS)} USDC`);
 
+    // Fix wallet address checksum
+    let checksummedAddress;
+    try {
+      checksummedAddress = ethers.getAddress(walletAddress);
+    } catch (e) {
+      console.error('❌ Invalid wallet address format:', walletAddress);
+      return { verified: false, message: 'Invalid wallet address format' };
+    }
+
+    console.log(`   Checking balance for: ${checksummedAddress}`);
+
     // Real USDC balance verification on Base
     const USDC_ABI = [
       'function balanceOf(address account) public view returns (uint256)',
@@ -116,7 +127,7 @@ async function verifyBaseUSDCPayment(walletAddress, deviceId, amountRequired) {
     ];
     
     const usdcContract = new ethers.Contract(USDC_CONTRACT, USDC_ABI, baseProvider);
-    const balance = await usdcContract.balanceOf(walletAddress);
+    const balance = await usdcContract.balanceOf(checksummedAddress);
     const balanceUSDC = ethers.formatUnits(balance, USDC_DECIMALS);
     const requiredUSDC = ethers.formatUnits(amountRequired, USDC_DECIMALS);
     
