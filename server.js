@@ -8,7 +8,7 @@ const PORT = process.env.PORT || 3000;
 
 // ============ ENVIRONMENT VARIABLES ============
 const ALCHEMY_RPC_URL = process.env.ALCHEMY_RPC_URL || 'https://base-mainnet.g.alchemy.com/v2/demo';
-const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || 'https://mainnet.helius-rpc.com/?api-key=3b904f43-e600-4d65-8cf4-aabf4d5fa5e3';
 const JWT_SECRET = process.env.JWT_SECRET || 'test-secret-key-change-me';
 const DEVICE_WALLET_ADDRESS = process.env.DEVICE_WALLET_ADDRESS || '0x0000000000000000000000000000000000000000';
 
