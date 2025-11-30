@@ -2,15 +2,26 @@ require('dotenv').config();
 const express = require('express');
 const { ethers } = require('ethers');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ============ ENVIRONMENT VARIABLES ============
-const ALCHEMY_RPC_URL = process.env.ALCHEMY_RPC_URL || 'https://base-mainnet.g.alchemy.com/v2/demo';
-const SOLANA_RPC_URL = process.env.SOLANA_RPC_URL || 'https://mainnet.helius-rpc.com/?api-key=3b904f43-e600-4d65-8cf4-aabf4d5fa5e3';
+const ALCHEMY_RPC_URL =
+  process.env.ALCHEMY_RPC_URL || 'https://base-mainnet.g.alchemy.com/v2/demo';
+const SOLANA_RPC_URL =
+  process.env.SOLANA_RPC_URL ||
+  'https://mainnet.helius-rpc.com/?api-key=3b904f43-e600-4d65-8cf4-aabf4d5fa5e3';
 const JWT_SECRET = process.env.JWT_SECRET || 'test-secret-key-change-me';
-const DEVICE_WALLET_ADDRESS = process.env.DEVICE_WALLET_ADDRESS || '0x0000000000000000000000000000000000000000';
+const DEVICE_WALLET_ADDRESS =
+  process.env.DEVICE_WALLET_ADDRESS ||
+  '0x0000000000000000000000000000000000000000';
+
+// Where TSE payments for X.402 should be sent
+const TSE_RECEIVER_WALLET =
+  process.env.TSE_RECEIVER_WALLET ||
+  'E7gnXdN4Nneh5KHBUgXVdUNXkBYtwNF4fkpzZU3otnmX';
 
 // USDC on Base
 const USDC_CONTRACT = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
@@ -21,16 +32,24 @@ const USDC_COST = ethers.parseUnits('0.50', USDC_DECIMALS);
 const TSE_MINT = 'yrEwtVJKbxghF3P3tJtPARSXUctkBvQ2xyqvRLztpRD';
 const TSE_DECIMALS = 9;
 const TSE_PRICE_USD = 0.00003134;
-const TSE_COST = Math.ceil((0.50 / TSE_PRICE_USD) * Math.pow(10, TSE_DECIMALS)); // ~15,947 TSE
+const TSE_COST = Math.ceil(
+  (0.5 / TSE_PRICE_USD) * Math.pow(10, TSE_DECIMALS)
+); // ~15,947 TSE
 
 // ============ MIDDLEWARE ============
 app.use(express.json());
 
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  
+  res.header(
+    'Access-Control-Allow-Headers',
+    'Origin, X-Requested-With, Content-Type, Accept, Authorization'
+  );
+  res.header(
+    'Access-Control-Allow-Methods',
+    'GET, POST, PUT, DELETE, OPTIONS'
+  );
+
   if (req.method === 'OPTIONS') {
     return res.sendStatus(200);
   }
@@ -80,7 +99,7 @@ const devices = {
   },
 };
 
-// ============ SESSION MANAGEMENT ============
+// ============ SESSION MANAGEMENT (EXISTING FLOW) ============
 
 function generateSessionToken(walletAddress, deviceId) {
   const payload = {
@@ -102,12 +121,19 @@ function verifySessionToken(token) {
   }
 }
 
-// ============ PAYMENT VERIFICATION ============
+// ============ PAYMENT VERIFICATION (BALANCE-BASED) ============
 
 async function verifyBaseUSDCPayment(walletAddress, deviceId, amountRequired) {
   try {
-    console.log(`\n💰 Verifying Base USDC payment from ${walletAddress.substring(0, 10)}...`);
-    console.log(`   Required: ${ethers.formatUnits(amountRequired, USDC_DECIMALS)} USDC`);
+    console.log(
+      `\n💰 Verifying Base USDC payment from ${walletAddress.substring(
+        0,
+        10
+      )}...`
+    );
+    console.log(
+      `   Required: ${ethers.formatUnits(amountRequired, USDC_DECIMALS)} USDC`
+    );
 
     // Fix wallet address checksum
     let checksummedAddress;
@@ -123,41 +149,70 @@ async function verifyBaseUSDCPayment(walletAddress, deviceId, amountRequired) {
     // Real USDC balance verification on Base
     const USDC_ABI = [
       'function balanceOf(address account) public view returns (uint256)',
-      'function decimals() public view returns (uint8)'
+      'function decimals() public view returns (uint8)',
     ];
-    
-    const usdcContract = new ethers.Contract(USDC_CONTRACT, USDC_ABI, baseProvider);
+
+    const usdcContract = new ethers.Contract(
+      USDC_CONTRACT,
+      USDC_ABI,
+      baseProvider
+    );
     const balance = await usdcContract.balanceOf(checksummedAddress);
     const balanceUSDC = ethers.formatUnits(balance, USDC_DECIMALS);
     const requiredUSDC = ethers.formatUnits(amountRequired, USDC_DECIMALS);
-    
+
     console.log(`   Wallet balance: ${balanceUSDC} USDC`);
-    
+
     if (parseFloat(balanceUSDC) >= parseFloat(requiredUSDC)) {
       console.log(`✅ USDC payment verified`);
-      return { verified: true, message: 'USDC payment verified', currency: 'USDC', balance: balanceUSDC };
+      return {
+        verified: true,
+        message: 'USDC payment verified',
+        currency: 'USDC',
+        balance: balanceUSDC,
+      };
     } else {
       console.log(`❌ Insufficient USDC balance`);
-      return { verified: false, message: `Insufficient USDC. Have: ${balanceUSDC}, Need: ${requiredUSDC}` };
+      return {
+        verified: false,
+        message: `Insufficient USDC. Have: ${balanceUSDC}, Need: ${requiredUSDC}`,
+      };
     }
   } catch (error) {
     console.error('❌ USDC verification error:', error.message);
-    return { verified: false, message: `USDC verification failed: ${error.message}` };
+    return {
+      verified: false,
+      message: `USDC verification failed: ${error.message}`,
+    };
   }
 }
 
-async function verifySolanaTokenPayment(walletAddress, deviceId, tokenMint, amountRequired) {
+async function verifySolanaTokenPayment(
+  walletAddress,
+  deviceId,
+  tokenMint,
+  amountRequired
+) {
   try {
-    console.log(`\n💰 Verifying Solana token payment from ${walletAddress.substring(0, 10)}...`);
+    console.log(
+      `\n💰 Verifying Solana token payment from ${walletAddress.substring(
+        0,
+        10
+      )}...`
+    );
     console.log(`   Token: ${tokenMint.substring(0, 10)}...`);
-    console.log(`   Required: ${amountRequired / Math.pow(10, TSE_DECIMALS)} TSE`);
+    console.log(
+      `   Required: ${
+        amountRequired / Math.pow(10, TSE_DECIMALS)
+      } TSE`
+    );
 
     // Import Solana web3.js
     const { Connection, PublicKey } = require('@solana/web3.js');
-    
+
     // Create connection to Solana mainnet
     const connection = new Connection(SOLANA_RPC_URL, 'confirmed');
-    
+
     // Parse wallet address
     let walletPublicKey;
     try {
@@ -180,19 +235,26 @@ async function verifySolanaTokenPayment(walletAddress, deviceId, tokenMint, amou
 
     if (tokenAccounts.value.length === 0) {
       console.log(`❌ No TSE token account found for wallet`);
-      return { verified: false, message: 'No TSE token account found. Please acquire some TSE.' };
+      return {
+        verified: false,
+        message: 'No TSE token account found. Please acquire some TSE.',
+      };
     }
 
     // Get the balance of the first token account
     const tokenAccount = tokenAccounts.value[0];
-    const accountInfo = await connection.getParsedAccountInfo(tokenAccount.pubkey);
-    
+    const accountInfo = await connection.getParsedAccountInfo(
+      tokenAccount.pubkey
+    );
+
     if (!accountInfo.value || !accountInfo.value.data.parsed) {
       console.log(`❌ Could not parse token account data`);
       return { verified: false, message: 'Error reading token account' };
     }
 
-    const balance = BigInt(accountInfo.value.data.parsed.info.tokenAmount.amount);
+    const balance = BigInt(
+      accountInfo.value.data.parsed.info.tokenAmount.amount
+    );
     const balanceTSE = Number(balance) / Math.pow(10, TSE_DECIMALS);
     const requiredTSE = amountRequired / Math.pow(10, TSE_DECIMALS);
 
@@ -201,17 +263,149 @@ async function verifySolanaTokenPayment(walletAddress, deviceId, tokenMint, amou
 
     if (balance >= BigInt(amountRequired)) {
       console.log(`✅ TSE payment verified`);
-      return { verified: true, message: 'TSE payment verified', currency: 'TSE', balance: balanceTSE.toFixed(2) };
+      return {
+        verified: true,
+        message: 'TSE payment verified',
+        currency: 'TSE',
+        balance: balanceTSE.toFixed(2),
+      };
     } else {
       console.log(`❌ Insufficient TSE balance`);
-      return { 
-        verified: false, 
-        message: `Insufficient TSE. Have: ${balanceTSE.toFixed(2)}, Need: ${requiredTSE.toFixed(2)}` 
+      return {
+        verified: false,
+        message: `Insufficient TSE. Have: ${balanceTSE.toFixed(
+          2
+        )}, Need: ${requiredTSE.toFixed(2)}`,
       };
     }
   } catch (error) {
     console.error('❌ Solana payment verification error:', error.message);
-    return { verified: false, message: `Solana verification failed: ${error.message}` };
+    return {
+      verified: false,
+      message: `Solana verification failed: ${error.message}`,
+    };
+  }
+}
+
+// ============ X.402 CHALLENGE STORE ============
+
+// In-memory challenge table (can move to DB later)
+const challenges = new Map();
+/*
+  challengeId -> {
+    deviceId,
+    walletAddress,
+    chain,
+    token,
+    amount,
+    receiver,
+    createdAt,
+    expiresAt,
+    paid,
+    txHash,
+    accessToken
+  }
+*/
+
+function createX402Challenge({
+  deviceId,
+  walletAddress,
+  chain,
+  token,
+  amount,
+  receiver,
+  ttlSeconds = 600,
+}) {
+  const challengeId = crypto.randomBytes(16).toString('hex');
+  const now = new Date();
+  const expiresAt = new Date(now.getTime() + ttlSeconds * 1000);
+
+  const record = {
+    deviceId,
+    walletAddress,
+    chain,
+    token,
+    amount,
+    receiver,
+    createdAt: now,
+    expiresAt,
+    paid: false,
+    txHash: null,
+    accessToken: null,
+  };
+
+  challenges.set(challengeId, record);
+  return { challengeId, record };
+}
+
+// Verify a real Solana TSE transaction for X.402
+async function verifySolanaTsePaymentByTx(
+  txHash,
+  expectedReceiver,
+  tokenMint,
+  amountRequired
+) {
+  try {
+    const { Connection, PublicKey } = require('@solana/web3.js');
+    const connection = new Connection(SOLANA_RPC_URL, 'confirmed');
+
+    console.log(`\n🔎 X.402: Checking Solana tx ${txHash}`);
+
+    const tx = await connection.getTransaction(txHash, {
+      maxSupportedTransactionVersion: 0,
+    });
+
+    if (!tx) {
+      console.log('❌ X.402: Transaction not found');
+      return { verified: false, message: 'Transaction not found' };
+    }
+
+    if (!tx.meta || tx.meta.err) {
+      console.log('❌ X.402: Transaction failed on-chain');
+      return { verified: false, message: 'On-chain transaction failed' };
+    }
+
+    const mintPk = new PublicKey(tokenMint);
+
+    const pre = tx.meta.preTokenBalances || [];
+    const post = tx.meta.postTokenBalances || [];
+
+    let receivedAmount = 0n;
+
+    for (let i = 0; i < post.length; i++) {
+      const p = post[i];
+      const old = pre[i];
+
+      if (p && p.mint === mintPk.toBase58()) {
+        const pa = BigInt(p.uiTokenAmount.amount);
+        const oa = old ? BigInt(old.uiTokenAmount.amount) : 0n;
+        const diff = pa - oa;
+        if (diff > 0n) {
+          receivedAmount += diff;
+        }
+      }
+    }
+
+    if (receivedAmount >= BigInt(amountRequired)) {
+      console.log('✅ X.402: TSE payment verified in tx');
+      return {
+        verified: true,
+        message: 'TSE payment verified by transaction',
+        amount: receivedAmount,
+      };
+    } else {
+      console.log('❌ X.402: Not enough TSE in tx');
+      return {
+        verified: false,
+        message: 'Transaction did not send required TSE amount',
+      };
+    }
+  } catch (error) {
+    console.error('❌ X.402 Solana tx verification error:', error.message);
+    return {
+      verified: false,
+      message: `Solana tx verification failed: ${error.message}`,
+    };
   }
 }
 
@@ -248,7 +442,7 @@ app.get('/devices/:deviceId', (req, res) => {
 });
 
 /**
- * Request authentication challenge
+ * Request authentication challenge (existing flow – NOT X.402)
  */
 app.post('/devices/:deviceId/challenge', (req, res) => {
   const { deviceId } = req.params;
@@ -262,9 +456,16 @@ app.post('/devices/:deviceId/challenge', (req, res) => {
     return res.status(400).json({ error: 'walletAddress required' });
   }
 
-  console.log(`\n🔐 Challenge requested for ${deviceId} by ${walletAddress.substring(0, 10)}...`);
+  console.log(
+    `\n🔐 Challenge requested for ${deviceId} by ${walletAddress.substring(
+      0,
+      10
+    )}...`
+  );
 
-  const challenge = Math.random().toString(36).substring(2, 15) + Date.now().toString(36);
+  const challenge =
+    Math.random().toString(36).substring(2, 15) +
+    Date.now().toString(36);
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000);
 
   res.json({
@@ -277,11 +478,12 @@ app.post('/devices/:deviceId/challenge', (req, res) => {
 
 /**
  * Verify wallet signature + payment → Issue session token
- * Supports both Base USDC and Solana TSE
+ * (existing flow – balance-based, NOT X.402)
  */
 app.post('/devices/:deviceId/verify', async (req, res) => {
   const { deviceId } = req.params;
-  const { walletAddress, challenge, signature, timestamp, paymentMethod } = req.body;
+  const { walletAddress, challenge, signature, timestamp, paymentMethod } =
+    req.body;
 
   if (!devices[deviceId]) {
     return res.status(404).json({ error: 'Device not found' });
@@ -291,7 +493,12 @@ app.post('/devices/:deviceId/verify', async (req, res) => {
     return res.status(400).json({ error: 'walletAddress required' });
   }
 
-  console.log(`\n🔐 Verify request for ${deviceId} from ${walletAddress.substring(0, 10)}...`);
+  console.log(
+    `\n🔐 Verify request for ${deviceId} from ${walletAddress.substring(
+      0,
+      10
+    )}...`
+  );
 
   const device = devices[deviceId];
 
@@ -303,15 +510,25 @@ app.post('/devices/:deviceId/verify', async (req, res) => {
     const method = paymentMethod?.toUpperCase() || 'USDC';
 
     if (method === 'TSE') {
-      paymentCheck = await verifySolanaTokenPayment(walletAddress, deviceId, TSE_MINT, TSE_COST);
+      paymentCheck = await verifySolanaTokenPayment(
+        walletAddress,
+        deviceId,
+        TSE_MINT,
+        TSE_COST
+      );
     } else {
-      paymentCheck = await verifyBaseUSDCPayment(walletAddress, deviceId, USDC_COST);
+      paymentCheck = await verifyBaseUSDCPayment(
+        walletAddress,
+        deviceId,
+        USDC_COST
+      );
     }
 
     if (!paymentCheck.verified) {
-      const amount = method === 'TSE'
-        ? `${(TSE_COST / Math.pow(10, TSE_DECIMALS)).toFixed(0)} TSE`
-        : `${ethers.formatUnits(USDC_COST, USDC_DECIMALS)} USDC`;
+      const amount =
+        method === 'TSE'
+          ? `${(TSE_COST / Math.pow(10, TSE_DECIMALS)).toFixed(0)} TSE`
+          : `${ethers.formatUnits(USDC_COST, USDC_DECIMALS)} USDC`;
 
       return res.status(402).json({
         verified: false,
@@ -325,7 +542,9 @@ app.post('/devices/:deviceId/verify', async (req, res) => {
     // Payment verified! Generate session token
     const sessionToken = generateSessionToken(walletAddress, deviceId);
 
-    console.log(`   ✅ Payment verified (${method}), issuing 30-min session token`);
+    console.log(
+      `   ✅ Payment verified (${method}), issuing 30-min session token`
+    );
 
     return res.json({
       verified: true,
@@ -335,10 +554,12 @@ app.post('/devices/:deviceId/verify', async (req, res) => {
       sessionDuration: 1800,
       expiresAt: new Date(Date.now() + 1800000).toISOString(),
       paymentMethod: method,
-      cost: method === 'TSE'
-        ? `${(TSE_COST / Math.pow(10, TSE_DECIMALS)).toFixed(0)} TSE`
-        : ethers.formatUnits(USDC_COST, USDC_DECIMALS),
-      message: `Session established - ${method} payment accepted. Pay once, unlimited lock/unlock for 30 minutes`,
+      cost:
+        method === 'TSE'
+          ? `${(TSE_COST / Math.pow(10, TSE_DECIMALS)).toFixed(0)} TSE`
+          : ethers.formatUnits(USDC_COST, USDC_DECIMALS),
+      message:
+        'Session established - ${method} payment accepted. Pay once, unlimited lock/unlock for 30 minutes',
     });
   }
 
@@ -348,15 +569,25 @@ app.post('/devices/:deviceId/verify', async (req, res) => {
     const method = paymentMethod?.toUpperCase() || 'USDC';
 
     if (method === 'TSE') {
-      paymentCheck = await verifySolanaTokenPayment(walletAddress, deviceId, TSE_MINT, TSE_COST);
+      paymentCheck = await verifySolanaTokenPayment(
+        walletAddress,
+        deviceId,
+        TSE_MINT,
+        TSE_COST
+      );
     } else {
-      paymentCheck = await verifyBaseUSDCPayment(walletAddress, deviceId, USDC_COST);
+      paymentCheck = await verifyBaseUSDCPayment(
+        walletAddress,
+        deviceId,
+        USDC_COST
+      );
     }
 
     if (!paymentCheck.verified) {
-      const amount = method === 'TSE'
-        ? `${(TSE_COST / Math.pow(10, TSE_DECIMALS)).toFixed(0)} TSE`
-        : `${ethers.formatUnits(USDC_COST, USDC_DECIMALS)} USDC`;
+      const amount =
+        method === 'TSE'
+          ? `${(TSE_COST / Math.pow(10, TSE_DECIMALS)).toFixed(0)} TSE`
+          : `${ethers.formatUnits(USDC_COST, USDC_DECIMALS)} USDC`;
 
       return res.status(402).json({
         verified: false,
@@ -374,9 +605,10 @@ app.post('/devices/:deviceId/verify', async (req, res) => {
       deviceData: device,
       accessLevel: 'brew',
       paymentMethod: method,
-      cost: method === 'TSE'
-        ? `${(TSE_COST / Math.pow(10, TSE_DECIMALS)).toFixed(0)} TSE`
-        : ethers.formatUnits(USDC_COST, USDC_DECIMALS),
+      cost:
+        method === 'TSE'
+          ? `${(TSE_COST / Math.pow(10, TSE_DECIMALS)).toFixed(0)} TSE`
+          : ethers.formatUnits(USDC_COST, USDC_DECIMALS),
       message: `${method} payment verified - select your brew type`,
     });
   }
@@ -385,7 +617,7 @@ app.post('/devices/:deviceId/verify', async (req, res) => {
 });
 
 /**
- * Unlock device (requires session token)
+ * Unlock device (requires session token – existing flow)
  */
 app.post('/devices/:deviceId/unlock', (req, res) => {
   const { deviceId } = req.params;
@@ -431,7 +663,7 @@ app.post('/devices/:deviceId/unlock', (req, res) => {
 });
 
 /**
- * Lock device (requires session token)
+ * Lock device (requires session token – existing flow)
  */
 app.post('/devices/:deviceId/lock', (req, res) => {
   const { deviceId } = req.params;
@@ -494,7 +726,9 @@ app.post('/devices/:deviceId/brew', (req, res) => {
     granted: true,
     action: 'brew',
     deviceId,
-    walletAddress: walletAddress ? walletAddress.substring(0, 10) + '...' : 'mock',
+    walletAddress: walletAddress
+      ? walletAddress.substring(0, 10) + '...'
+      : 'mock',
     brewType: brewType,
     timestamp: new Date().toISOString(),
     brewTime: 30,
@@ -518,11 +752,11 @@ app.get('/devices/:deviceId/status', (req, res) => {
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.slice(7);
     const decoded = verifySessionToken(token);
-    
+
     if (decoded) {
       const now = Math.floor(Date.now() / 1000);
       const secondsRemaining = decoded.exp - now;
-      
+
       sessionInfo = {
         valid: true,
         expiresAt: new Date(decoded.exp * 1000).toISOString(),
@@ -542,6 +776,238 @@ app.get('/devices/:deviceId/status', (req, res) => {
   });
 });
 
+// ============ X.402 ROUTES ============
+
+/**
+ * X.402: Request payment challenge
+ * POST /x402/:deviceId/challenge
+ * body: { walletAddress }
+ */
+app.post('/x402/:deviceId/challenge', (req, res) => {
+  const { deviceId } = req.params;
+  const { walletAddress } = req.body;
+
+  const device = devices[deviceId];
+  if (!device) {
+    return res.status(404).json({ error: 'Device not found', deviceId });
+  }
+  if (!walletAddress) {
+    return res.status(400).json({ error: 'walletAddress required' });
+  }
+
+  console.log(
+    `\n🧾 X.402 challenge requested for ${deviceId} by ${walletAddress.substring(
+      0,
+      10
+    )}...`
+  );
+
+  const amountRequired = TSE_COST;
+
+  const { challengeId, record } = createX402Challenge({
+    deviceId,
+    walletAddress,
+    chain: 'solana',
+    token: 'TSE',
+    amount: amountRequired,
+    receiver: TSE_RECEIVER_WALLET,
+    ttlSeconds: 600, // 10 minutes
+  });
+
+  return res.json({
+    challengeId,
+    deviceId,
+    payment: {
+      chain: record.chain,
+      token: record.token,
+      amount: record.amount,
+      mint: TSE_MINT,
+      receiver: record.receiver,
+      decimals: TSE_DECIMALS,
+      expiresAt: record.expiresAt.toISOString(),
+    },
+    message:
+      'Send the specified TSE amount to the receiver address before expiresAt, then call /x402/:deviceId/verify with the txHash.',
+  });
+});
+
+/**
+ * X.402: Verify payment + issue access token
+ * POST /x402/:deviceId/verify
+ * body: { walletAddress, challengeId, txHash }
+ */
+app.post('/x402/:deviceId/verify', async (req, res) => {
+  const { deviceId } = req.params;
+  const { walletAddress, challengeId, txHash } = req.body;
+
+  const device = devices[deviceId];
+  if (!device) {
+    return res.status(404).json({ error: 'Device not found', deviceId });
+  }
+
+  if (!walletAddress || !challengeId || !txHash) {
+    return res
+      .status(400)
+      .json({ error: 'walletAddress, challengeId and txHash required' });
+  }
+
+  const record = challenges.get(challengeId);
+  if (!record) {
+    return res.status(404).json({ error: 'Challenge not found', challengeId });
+  }
+
+  if (record.deviceId !== deviceId) {
+    return res.status(400).json({ error: 'Challenge does not match device' });
+  }
+
+  if (record.walletAddress !== walletAddress) {
+    return res.status(400).json({ error: 'Challenge does not belong to wallet' });
+  }
+
+  const now = new Date();
+  if (now > record.expiresAt) {
+    return res.status(410).json({ error: 'Challenge expired' });
+  }
+
+  if (record.paid) {
+    return res.status(409).json({
+      error: 'Challenge already used',
+      accessToken: record.accessToken,
+      txHash: record.txHash,
+    });
+  }
+
+  console.log(
+    `\n💳 X.402 verify for challenge ${challengeId}, tx ${txHash}`
+  );
+
+  const paymentCheck = await verifySolanaTsePaymentByTx(
+    txHash,
+    record.receiver,
+    TSE_MINT,
+    record.amount
+  );
+
+  if (!paymentCheck.verified) {
+    return res.status(402).json({
+      verified: false,
+      message: paymentCheck.message,
+      challengeId,
+    });
+  }
+
+  // Issue X.402 access token (JWT)
+  const payload = {
+    type: 'x402-access',
+    walletAddress,
+    deviceId,
+    challengeId,
+    txHash,
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 1800, // 30 minutes
+  };
+
+  const accessToken = jwt.sign(payload, JWT_SECRET);
+
+  record.paid = true;
+  record.txHash = txHash;
+  record.accessToken = accessToken;
+  challenges.set(challengeId, record);
+
+  console.log(`✅ X.402 access token issued for ${deviceId}`);
+
+  return res.json({
+    verified: true,
+    deviceId,
+    challengeId,
+    txHash,
+    accessToken,
+    expiresAt: new Date(payload.exp * 1000).toISOString(),
+    message:
+      'Payment verified. Use this accessToken as Bearer token to control the device via X.402 endpoints.',
+  });
+});
+
+/**
+ * Middleware: require valid X.402 access token
+ */
+function requireX402(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res
+      .status(401)
+      .json({ error: 'Missing or invalid Authorization header' });
+  }
+
+  const token = authHeader.slice(7);
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.type !== 'x402-access') {
+      throw new Error('Wrong token type');
+    }
+    req.x402 = decoded;
+    next();
+  } catch (error) {
+    return res.status(401).json({
+      error: 'Invalid or expired X.402 access token',
+      message: error.message,
+    });
+  }
+}
+
+/**
+ * X.402: Unlock using X.402 token
+ */
+app.post('/x402/:deviceId/unlock', requireX402, (req, res) => {
+  const { deviceId } = req.params;
+
+  if (req.x402.deviceId !== deviceId) {
+    return res
+      .status(403)
+      .json({ error: 'Token not valid for this device' });
+  }
+
+  console.log(`\n🔓 X.402 unlock request for ${deviceId} (token OK)`);
+
+  res.json({
+    success: true,
+    granted: true,
+    action: 'unlock',
+    deviceId,
+    walletAddress: req.x402.walletAddress.substring(0, 10) + '...',
+    timestamp: new Date().toISOString(),
+    sessionExpiresAt: new Date(req.x402.exp * 1000).toISOString(),
+    message: '✅ Device unlocked via X.402 access token',
+  });
+});
+
+/**
+ * X.402: Lock using X.402 token
+ */
+app.post('/x402/:deviceId/lock', requireX402, (req, res) => {
+  const { deviceId } = req.params;
+
+  if (req.x402.deviceId !== deviceId) {
+    return res
+      .status(403)
+      .json({ error: 'Token not valid for this device' });
+  }
+
+  console.log(`\n🔒 X.402 lock request for ${deviceId} (token OK)`);
+
+  res.json({
+    success: true,
+    granted: true,
+    action: 'lock',
+    deviceId,
+    walletAddress: req.x402.walletAddress.substring(0, 10) + '...',
+    timestamp: new Date().toISOString(),
+    sessionExpiresAt: new Date(req.x402.exp * 1000).toISOString(),
+    message: '✅ Device locked via X.402 access token',
+  });
+});
+
 // ============ ERROR HANDLING ============
 app.use((err, req, res, next) => {
   console.error('❌ Error:', err.message);
@@ -558,8 +1024,9 @@ app.listen(PORT, () => {
   console.log('🔒 Lock System: Pay once per 30-min session');
   console.log('☕ Coffee: Pay per brew');
   console.log('💰 Payment Methods: USDC (Base) & TSE (Solana)');
+  console.log('📡 TSE Receiver Wallet (X.402):', TSE_RECEIVER_WALLET);
   console.log('📱 Available Devices:');
-  Object.keys(devices).forEach(id => {
+  Object.keys(devices).forEach((id) => {
     const device = devices[id];
     console.log(`   - ${id}: ${device.deviceName}`);
   });
