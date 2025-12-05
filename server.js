@@ -1008,6 +1008,242 @@ app.post('/x402/:deviceId/lock', requireX402, (req, res) => {
   });
 });
 
+// ============ PHANTOM TRANSACTION BUILDING (NEW) ============
+
+/**
+ * Build a Solana transaction for Phantom to sign
+ * POST /transactions/build
+ * body: { senderWallet, recipientWallet, amount, tokenType }
+ */
+app.post('/transactions/build', async (req, res) => {
+  const { senderWallet, recipientWallet, amount, tokenType } = req.body;
+
+  console.log(`\n💳 Building ${tokenType} transaction...`);
+  console.log(`   Sender: ${senderWallet?.substring(0, 10)}...`);
+  console.log(`   Recipient: ${recipientWallet?.substring(0, 10)}...`);
+  console.log(`   Amount: ${amount}`);
+
+  // Validate inputs
+  if (!senderWallet || !recipientWallet || !amount || !tokenType) {
+    return res.status(400).json({
+      success: false,
+      error: 'Missing required fields: senderWallet, recipientWallet, amount, tokenType',
+    });
+  }
+
+  try {
+    const {
+      Connection,
+      PublicKey,
+      Transaction,
+      SystemProgram,
+      LAMPORTS_PER_SOL,
+    } = require('@solana/web3.js');
+    const {
+      getAssociatedTokenAddress,
+      createTransferInstruction,
+      createAssociatedTokenAccountInstruction,
+      TOKEN_PROGRAM_ID,
+      ASSOCIATED_TOKEN_PROGRAM_ID,
+    } = require('@solana/spl-token');
+
+    const connection = new Connection(SOLANA_RPC_URL, 'confirmed');
+
+    // Parse addresses
+    let sender, recipient;
+    try {
+      sender = new PublicKey(senderWallet);
+      recipient = new PublicKey(recipientWallet);
+    } catch (e) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid wallet address format',
+      });
+    }
+
+    // Get recent blockhash
+    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+
+    const transaction = new Transaction();
+    transaction.recentBlockhash = blockhash;
+    transaction.lastValidBlockHeight = lastValidBlockHeight;
+    transaction.feePayer = sender;
+
+    if (tokenType.toUpperCase() === 'SOL') {
+      // Native SOL transfer
+      const lamports = Math.floor(amount * LAMPORTS_PER_SOL);
+      console.log(`   Lamports: ${lamports}`);
+
+      transaction.add(
+        SystemProgram.transfer({
+          fromPubkey: sender,
+          toPubkey: recipient,
+          lamports: lamports,
+        })
+      );
+    } else if (tokenType.toUpperCase() === 'TSE') {
+      // TSE token transfer
+      const tseMint = new PublicKey(TSE_MINT);
+      const tokenAmount = Math.floor(amount * Math.pow(10, TSE_DECIMALS));
+      console.log(`   Token amount (raw): ${tokenAmount}`);
+
+      // Get sender's token account
+      const senderTokenAccount = await getAssociatedTokenAddress(
+        tseMint,
+        sender,
+        false,
+        TOKEN_PROGRAM_ID,
+        ASSOCIATED_TOKEN_PROGRAM_ID
+      );
+
+      // Check sender has token account
+      const senderAccountInfo = await connection.getAccountInfo(senderTokenAccount);
+      if (!senderAccountInfo) {
+        return res.status(400).json({
+          success: false,
+          error: 'Sender does not have a TSE token account',
+        });
+      }
+
+      // Get recipient's token account
+      const recipientTokenAccount = await getAssociatedTokenAddress(
+        tseMint,
+        recipient,
+        false,
+        TOKEN_PROGRAM_ID,
+        ASSOCIATED_TOKEN_PROGRAM_ID
+      );
+
+      // Check if recipient token account exists
+      const recipientAccountInfo = await connection.getAccountInfo(recipientTokenAccount);
+      if (!recipientAccountInfo) {
+        // Create associated token account for recipient
+        console.log('   Creating recipient token account...');
+        transaction.add(
+          createAssociatedTokenAccountInstruction(
+            sender, // payer
+            recipientTokenAccount, // ata
+            recipient, // owner
+            tseMint, // mint
+            TOKEN_PROGRAM_ID,
+            ASSOCIATED_TOKEN_PROGRAM_ID
+          )
+        );
+      }
+
+      // Add transfer instruction
+      transaction.add(
+        createTransferInstruction(
+          senderTokenAccount,
+          recipientTokenAccount,
+          sender,
+          tokenAmount,
+          [],
+          TOKEN_PROGRAM_ID
+        )
+      );
+    } else {
+      return res.status(400).json({
+        success: false,
+        error: `Unknown token type: ${tokenType}. Use 'SOL' or 'TSE'.`,
+      });
+    }
+
+    // Serialize transaction (without signatures)
+    const serialized = transaction.serialize({
+      requireAllSignatures: false,
+      verifySignatures: false,
+    });
+
+    const base64Tx = serialized.toString('base64');
+    console.log(`✅ Transaction built, base64 length: ${base64Tx.length}`);
+
+    return res.json({
+      success: true,
+      transaction: base64Tx,
+      message: 'Transaction built successfully. Send to Phantom for signing.',
+    });
+  } catch (error) {
+    console.error('❌ Error building transaction:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+/**
+ * Submit a signed transaction to Solana
+ * POST /transactions/submit
+ * body: { signature, transaction }
+ * 
+ * Note: Phantom returns the fully signed transaction, not just the signature.
+ * The 'transaction' field should contain the signed transaction from Phantom.
+ */
+app.post('/transactions/submit', async (req, res) => {
+  const { signature, transaction } = req.body;
+
+  console.log(`\n📤 Submitting signed transaction to Solana...`);
+
+  if (!transaction) {
+    return res.status(400).json({
+      success: false,
+      error: 'Missing required field: transaction',
+    });
+  }
+
+  try {
+    const { Connection } = require('@solana/web3.js');
+    const connection = new Connection(SOLANA_RPC_URL, 'confirmed');
+
+    // Decode the base64 transaction
+    const txBuffer = Buffer.from(transaction, 'base64');
+
+    // Send the raw transaction
+    const txHash = await connection.sendRawTransaction(txBuffer, {
+      skipPreflight: false,
+      preflightCommitment: 'confirmed',
+      maxRetries: 3,
+    });
+
+    console.log(`✅ Transaction sent: ${txHash}`);
+
+    // Wait for confirmation
+    console.log('   Waiting for confirmation...');
+    const confirmation = await connection.confirmTransaction(
+      {
+        signature: txHash,
+        blockhash: (await connection.getLatestBlockhash()).blockhash,
+        lastValidBlockHeight: (await connection.getLatestBlockhash()).lastValidBlockHeight,
+      },
+      'confirmed'
+    );
+
+    if (confirmation.value.err) {
+      console.error('❌ Transaction failed:', confirmation.value.err);
+      return res.status(400).json({
+        success: false,
+        error: 'Transaction failed on-chain',
+        details: confirmation.value.err,
+      });
+    }
+
+    console.log(`✅ Transaction confirmed: ${txHash}`);
+
+    return res.json({
+      success: true,
+      txHash: txHash,
+      message: 'Transaction submitted and confirmed successfully',
+    });
+  } catch (error) {
+    console.error('❌ Error submitting transaction:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
 // ============ ERROR HANDLING ============
 app.use((err, req, res, next) => {
   console.error('❌ Error:', err.message);
@@ -1025,6 +1261,8 @@ app.listen(PORT, () => {
   console.log('☕ Coffee: Pay per brew');
   console.log('💰 Payment Methods: USDC (Base) & TSE (Solana)');
   console.log('📡 TSE Receiver Wallet (X.402):', TSE_RECEIVER_WALLET);
+  console.log('💳 Transaction Building: /transactions/build');
+  console.log('📤 Transaction Submit: /transactions/submit');
   console.log('📱 Available Devices:');
   Object.keys(devices).forEach((id) => {
     const device = devices[id];
