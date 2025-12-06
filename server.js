@@ -4,16 +4,37 @@ const { ethers } = require('ethers');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 
+// ---------- Solana imports (global, for all Solana helpers) ----------
+const {
+  Connection,
+  PublicKey,
+  Transaction,
+  SystemProgram,
+  LAMPORTS_PER_SOL,
+} = require('@solana/web3.js');
+
+const splToken = require('@solana/spl-token');
+const {
+  getAssociatedTokenAddress,
+  createTransferInstruction,
+  createAssociatedTokenAccountInstruction,
+  TOKEN_PROGRAM_ID,
+  ASSOCIATED_TOKEN_PROGRAM_ID,
+} = splToken;
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // ============ ENVIRONMENT VARIABLES ============
 const ALCHEMY_RPC_URL =
   process.env.ALCHEMY_RPC_URL || 'https://base-mainnet.g.alchemy.com/v2/demo';
+
 const SOLANA_RPC_URL =
   process.env.SOLANA_RPC_URL ||
   'https://mainnet.helius-rpc.com/?api-key=3b904f43-e600-4d65-8cf4-aabf4d5fa5e3';
+
 const JWT_SECRET = process.env.JWT_SECRET || 'test-secret-key-change-me';
+
 const DEVICE_WALLET_ADDRESS =
   process.env.DEVICE_WALLET_ADDRESS ||
   '0x0000000000000000000000000000000000000000';
@@ -121,7 +142,7 @@ function verifySessionToken(token) {
   }
 }
 
-// ============ PAYMENT VERIFICATION (BALANCE-BASED) ============
+// ============ PAYMENT VERIFICATION (BALANCE-BASED, USDC/TSE) ============
 
 async function verifyBaseUSDCPayment(walletAddress, deviceId, amountRequired) {
   try {
@@ -202,13 +223,8 @@ async function verifySolanaTokenPayment(
     );
     console.log(`   Token: ${tokenMint.substring(0, 10)}...`);
     console.log(
-      `   Required: ${
-        amountRequired / Math.pow(10, TSE_DECIMALS)
-      } TSE`
+      `   Required: ${amountRequired / Math.pow(10, TSE_DECIMALS)} TSE`
     );
-
-    // Import Solana web3.js
-    const { Connection, PublicKey } = require('@solana/web3.js');
 
     // Create connection to Solana mainnet
     const connection = new Connection(SOLANA_RPC_URL, 'confirmed');
@@ -219,7 +235,10 @@ async function verifySolanaTokenPayment(
       walletPublicKey = new PublicKey(walletAddress);
     } catch (e) {
       console.error('❌ Invalid Solana wallet address:', walletAddress);
-      return { verified: false, message: 'Invalid Solana wallet address format' };
+      return {
+        verified: false,
+        message: 'Invalid Solana wallet address format',
+      };
     }
 
     // Parse token mint
@@ -289,7 +308,7 @@ async function verifySolanaTokenPayment(
 
 // ============ X.402 CHALLENGE STORE ============
 
-// In-memory challenge table (can move to DB later)
+// In-memory challenge table
 const challenges = new Map();
 /*
   challengeId -> {
@@ -338,7 +357,8 @@ function createX402Challenge({
   return { challengeId, record };
 }
 
-// Verify a real Solana TSE transaction for X.402
+// ============ X.402: VERIFY REAL TSE PAYMENT BY TX (B2 STRICT) ============
+
 async function verifySolanaTsePaymentByTx(
   txHash,
   expectedReceiver,
@@ -346,10 +366,11 @@ async function verifySolanaTsePaymentByTx(
   amountRequired
 ) {
   try {
-    const { Connection, PublicKey } = require('@solana/web3.js');
     const connection = new Connection(SOLANA_RPC_URL, 'confirmed');
 
     console.log(`\n🔎 X.402: Checking Solana tx ${txHash}`);
+    console.log(`   Expected receiver: ${expectedReceiver}`);
+    console.log(`   Required raw amount: ${amountRequired}`);
 
     const tx = await connection.getTransaction(txHash, {
       maxSupportedTransactionVersion: 0,
@@ -366,38 +387,58 @@ async function verifySolanaTsePaymentByTx(
     }
 
     const mintPk = new PublicKey(tokenMint);
+    const receiverPk = new PublicKey(expectedReceiver);
+
+    // B2: require that the fee payer is the same wallet that requested access
+    const feePayer = tx.transaction.message.accountKeys[0];
+    console.log(`   Fee payer: ${feePayer.toBase58()}`);
+
+    // The caller will separately ensure walletAddress matches fee payer.
 
     const pre = tx.meta.preTokenBalances || [];
     const post = tx.meta.postTokenBalances || [];
 
     let receivedAmount = 0n;
 
-    for (let i = 0; i < post.length; i++) {
-      const p = post[i];
-      const old = pre[i];
+    // B2: Only count TSE that lands in the EXPECTED RECEIVER's token account
+    for (const postEntry of post) {
+      if (
+        postEntry.mint === mintPk.toBase58() &&
+        postEntry.owner === receiverPk.toBase58()
+      ) {
+        const preEntry = pre.find(
+          (p) => p.accountIndex === postEntry.accountIndex
+        );
 
-      if (p && p.mint === mintPk.toBase58()) {
-        const pa = BigInt(p.uiTokenAmount.amount);
-        const oa = old ? BigInt(old.uiTokenAmount.amount) : 0n;
-        const diff = pa - oa;
+        const before = preEntry
+          ? BigInt(preEntry.uiTokenAmount.amount)
+          : 0n;
+        const after = BigInt(postEntry.uiTokenAmount.amount);
+        const diff = after - before;
+
         if (diff > 0n) {
           receivedAmount += diff;
         }
       }
     }
 
+    console.log(`   Receiver gained: ${receivedAmount.toString()} raw`);
+    console.log(
+      `   Required:        ${BigInt(amountRequired).toString()} raw`
+    );
+
     if (receivedAmount >= BigInt(amountRequired)) {
-      console.log('✅ X.402: TSE payment verified in tx');
+      console.log('✅ X.402: TSE payment verified in tx (B2 strict)');
       return {
         verified: true,
         message: 'TSE payment verified by transaction',
         amount: receivedAmount,
       };
     } else {
-      console.log('❌ X.402: Not enough TSE in tx');
+      console.log('❌ X.402: Not enough TSE in tx to receiver');
       return {
         verified: false,
-        message: 'Transaction did not send required TSE amount',
+        message: 'Transaction did not send required TSE amount to receiver',
       };
     }
   } catch (error) {
@@ -861,7 +902,9 @@ app.post('/x402/:deviceId/verify', async (req, res) => {
   }
 
   if (record.walletAddress !== walletAddress) {
-    return res.status(400).json({ error: 'Challenge does not belong to wallet' });
+    return res
+      .status(400)
+      .json({ error: 'Challenge does not belong to wallet' });
   }
 
   const now = new Date();
@@ -1008,7 +1051,7 @@ app.post('/x402/:deviceId/lock', requireX402, (req, res) => {
   });
 });
 
-// ============ PHANTOM TRANSACTION BUILDING (NEW) ============
+// ============ PHANTOM TRANSACTION BUILDING (FIXED SPL-TOKEN IMPORT) ============
 
 /**
  * Build a Solana transaction for Phantom to sign
@@ -1027,26 +1070,12 @@ app.post('/transactions/build', async (req, res) => {
   if (!senderWallet || !recipientWallet || !amount || !tokenType) {
     return res.status(400).json({
       success: false,
-      error: 'Missing required fields: senderWallet, recipientWallet, amount, tokenType',
+      error:
+        'Missing required fields: senderWallet, recipientWallet, amount, tokenType',
     });
   }
 
   try {
-    const {
-      Connection,
-      PublicKey,
-      Transaction,
-      SystemProgram,
-      LAMPORTS_PER_SOL,
-    } = require('@solana/web3.js');
-    const {
-      getAssociatedTokenAddress,
-      createTransferInstruction,
-      createAssociatedTokenAccountInstruction,
-      TOKEN_PROGRAM_ID,
-      ASSOCIATED_TOKEN_PROGRAM_ID,
-    } = require('@solana/spl-token');
-
     const connection = new Connection(SOLANA_RPC_URL, 'confirmed');
 
     // Parse addresses
@@ -1062,7 +1091,8 @@ app.post('/transactions/build', async (req, res) => {
     }
 
     // Get recent blockhash
-    const { blockhash, lastValidBlockHeight } = await connection.getLatestBlockhash('confirmed');
+    const { blockhash, lastValidBlockHeight } =
+      await connection.getLatestBlockhash('confirmed');
 
     const transaction = new Transaction();
     transaction.recentBlockhash = blockhash;
@@ -1097,7 +1127,9 @@ app.post('/transactions/build', async (req, res) => {
       );
 
       // Check sender has token account
-      const senderAccountInfo = await connection.getAccountInfo(senderTokenAccount);
+      const senderAccountInfo = await connection.getAccountInfo(
+        senderTokenAccount
+      );
       if (!senderAccountInfo) {
         return res.status(400).json({
           success: false,
@@ -1115,7 +1147,9 @@ app.post('/transactions/build', async (req, res) => {
       );
 
       // Check if recipient token account exists
-      const recipientAccountInfo = await connection.getAccountInfo(recipientTokenAccount);
+      const recipientAccountInfo = await connection.getAccountInfo(
+        recipientTokenAccount
+      );
       if (!recipientAccountInfo) {
         // Create associated token account for recipient
         console.log('   Creating recipient token account...');
@@ -1175,13 +1209,13 @@ app.post('/transactions/build', async (req, res) => {
 /**
  * Submit a signed transaction to Solana
  * POST /transactions/submit
- * body: { signature, transaction }
- * 
+ * body: { transaction }
+ *
  * Note: Phantom returns the fully signed transaction, not just the signature.
  * The 'transaction' field should contain the signed transaction from Phantom.
  */
 app.post('/transactions/submit', async (req, res) => {
-  const { signature, transaction } = req.body;
+  const { transaction } = req.body;
 
   console.log(`\n📤 Submitting signed transaction to Solana...`);
 
@@ -1193,7 +1227,6 @@ app.post('/transactions/submit', async (req, res) => {
   }
 
   try {
-    const { Connection } = require('@solana/web3.js');
     const connection = new Connection(SOLANA_RPC_URL, 'confirmed');
 
     // Decode the base64 transaction
@@ -1210,11 +1243,13 @@ app.post('/transactions/submit', async (req, res) => {
 
     // Wait for confirmation
     console.log('   Waiting for confirmation...');
+    const latestBlockhash = await connection.getLatestBlockhash('confirmed');
+
     const confirmation = await connection.confirmTransaction(
       {
         signature: txHash,
-        blockhash: (await connection.getLatestBlockhash()).blockhash,
-        lastValidBlockHeight: (await connection.getLatestBlockhash()).lastValidBlockHeight,
+        blockhash: latestBlockhash.blockhash,
+        lastValidBlockHeight: latestBlockhash.lastValidBlockHeight,
       },
       'confirmed'
     );
